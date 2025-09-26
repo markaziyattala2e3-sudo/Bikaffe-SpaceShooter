@@ -60,7 +60,7 @@ const SHIP_MAX_SPEED=520, SHIP_ACCEL=3000, SHIP_FRICTION=2200;
 const BASE_COOLDOWN=0.12, RAPID_COOLDOWN=0.06;
 
 const DEBRIS_CHANCE=0.25;
-const DROP_CHANCE=0.10;
+const DROP_CHANCE=0.07;
 
 const SHAKE_HIT=0.01, SHAKE_DECAY=1.4;
 
@@ -78,7 +78,7 @@ const SPARKLE_RATE = 18;
 
 // ---------- State ----------
 let stars=[], bricks=[], bullets=[], debris=[], particles=[], enemies=[], powerups=[];
-let ship, score=0, lives=5, state="play", t=0, lastTs=0, shake=0, winTimer=0, rapidTime=0, hasShield=false, invuln=0;
+let ship, score=0, lives=3, state="play", t=0, lastTs=0, shake=0, winTimer=0, rapidTime=0, hasShield=false, invuln=0;
 const keys={};
 let pointerDown=false, pointerX=null, pointerSmoothedX=null, lastTap=0;
 
@@ -196,7 +196,7 @@ function blip(f=440,d=0.05){try{
 
 // ---------- Reset / Init ----------
 function hardReset(){
-  score=0; lives=5; state="play"; t=0; shake=0; winTimer=0; rapidTime=0; hasShield=false; invuln=0;
+  score=0; lives=3; state="play"; t=0; shake=0; winTimer=0; rapidTime=0; hasShield=false; invuln=0;
   ship={x:W/2,y:shipBaselineY(),w:28,h:18,vx:0,cooldown:0};
   instantiateBricks(); buildStars();
   bullets.length=debris.length=particles.length=enemies.length=powerups.length=0;
