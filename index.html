@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-<title>بكفي — Retro Space Shooter (v10+)</title>
+<meta name="color-scheme" content="dark" />
+<title>بكفي — Retro Space Shooter (drops+smooth move — fixed)</title>
 <style>
   html,body{margin:0;height:100%;background:#000;color:#e7eefc}
   #stage{position:fixed; inset:0; overflow:hidden; touch-action:none}
@@ -21,10 +22,11 @@
 
 <script>
 /* ============================================================
-   بكفي — Retro Space Shooter (v10+ tweaks)
-   - Threat visuals for debris & enemies (glow, trails, spikes, pulsing core)
-   - Word higher, player a bit higher (thumb-safe)
-   - Everything else unchanged
+   Fixes:
+   - meta viewport uses maximum-scale (not "maximum")
+   - Powerup halo: guard createRadialGradient against non-finite values
+     (defaults renderY to y; checks via Number.isFinite)
+   - nextEnemyTime simplified
 ============================================================ */
 
 // ---------- Canvas ----------
@@ -33,7 +35,7 @@ const canvas=document.getElementById('game');
 const ctx=canvas.getContext('2d', {alpha:true, willReadFrequently:true});
 let DPR=1, W=960, H=540;
 
-function resize(){
+function _resizeNow(){
   DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
   W = Math.floor(window.innerWidth); H = Math.floor(window.innerHeight);
   canvas.width = Math.floor(W*DPR); canvas.height = Math.floor(H*DPR);
@@ -42,6 +44,8 @@ function resize(){
   ctx.imageSmoothingEnabled=false;
   layoutWordFit();
 }
+let _rzId=0;
+function resize(){ cancelAnimationFrame(_rzId); _rzId=requestAnimationFrame(_resizeNow); }
 addEventListener('resize', resize);
 
 // ---------- Env & tuning ----------
@@ -50,13 +54,12 @@ const pal={ wall:"#1b2030", brick:"#ff3b3b", ship:"#aef59a", bullet:"#ffffff",
             debris:"#ff3b3b", enemy:"#b687ff", powRapid:"#6ecbff", powShield:"#ffd166" };
 
 const BASE_BLOCK=12, BASE_GAP=1, CELL=BASE_BLOCK+BASE_GAP;
-// const TOP_FRACTION=0.15;
-const TOP_FRACTION=0.09;                         // [CHANGED] move word higher
+const TOP_FRACTION=0.09;
 
 const SHIP_MAX_SPEED=520, SHIP_ACCEL=3000, SHIP_FRICTION=2200;
 const BASE_COOLDOWN=0.12, RAPID_COOLDOWN=0.06;
 
-const DEBRIS_CHANCE=0.20;
+const DEBRIS_CHANCE=0.25;
 const DROP_CHANCE=0.10;
 
 const SHAKE_HIT=0.01, SHAKE_DECAY=1.4;
@@ -65,14 +68,19 @@ const ENEMY_MIN_INTERVAL=IS_TOUCH?2.8:2.4;
 const ENEMY_MAX_INTERVAL=IS_TOUCH?4.6:4.0;
 const ENEMY_MAX_ACTIVE=IS_TOUCH?4:5;
 
-// --- NEW: make player sit a bit higher, responsive to screen height ---
-const SHIP_PAD_FRAC = IS_TOUCH ? 0.20 : 0.18;    // [NEW] 20% (touch) / 18% (desktop) from bottom
+const SHIP_PAD_FRAC = IS_TOUCH ? 0.20 : 0.18;
 function shipBaselineY(){ return Math.round(H * (1 - SHIP_PAD_FRAC)); }
+
+// --- Powerup magnet & sparkle tuning ---
+const MAGNET_RADIUS = 140;
+const MAGNET_STRENGTH = 900;
+const SPARKLE_RATE = 18;
 
 // ---------- State ----------
 let stars=[], bricks=[], bullets=[], debris=[], particles=[], enemies=[], powerups=[];
-let ship, score=0, lives=5, state="play", t=0, lastTs=0, shake=1, winTimer=0, rapidTime=0, hasShield=false;
-const keys={}; let pointerDown=false, pointerX=null, lastTap=0;
+let ship, score=0, lives=5, state="play", t=0, lastTs=0, shake=0, winTimer=0, rapidTime=0, hasShield=false, invuln=0;
+const keys={};
+let pointerDown=false, pointerX=null, pointerSmoothedX=null, lastTap=0;
 
 // ---------- Offscreen word raster ("بكفي") ----------
 const fontStack='"Noto Naskh Arabic","Scheherazade New","Amiri","Segoe UI Historic","Arial","sans-serif"';
@@ -130,9 +138,7 @@ function buildWordGrid(word="بكفي"){
   }
 
   minC=cMin; minR=rMin;
-  baseBricks = occupied.map(({c,r})=>({
-    x:(c-minC)*CELL, y:(r-minR)*CELL, w:BASE_BLOCK, h:BASE_BLOCK, alive:true, flash:0
-  }));
+  baseBricks = occupied.map(({c,r})=>({ x:(c-minC)*CELL, y:(r-minR)*CELL, w:BASE_BLOCK, h:BASE_BLOCK, alive:true }));
   baseWidth  = (cMax - cMin + 1) * CELL;
   baseHeight = (rMax - rMin + 1) * CELL;
 
@@ -150,28 +156,37 @@ function layoutWordFit(){
   wordOffX=Math.floor((W-wpx)/2);
   wordOffY=Math.floor(top + (fitH-hpx)/2);
 }
-function instantiateBricks(){ bricks = baseBricks.map(b=>({bx:b.x,by:b.y,w:b.w,h:b.h,alive:true,flash:0})); }
+function instantiateBricks(){ bricks = baseBricks.map(b=>({bx:b.x,by:b.y,w:b.w,h:b.h,alive:true})); }
 
 // ---------- Helpers ----------
 function rectHit(ax,ay,aw,ah,bx,by,bw,bh){return ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by;}
 
 // ---------- Stars ----------
-function buildStars(){ stars.length=0; const n=Math.round((W*H)/9000); for(let i=0;i<n;i++) stars.push({x:Math.random()*W,y:Math.random()*H,z:Math.random()*2+0.5}); }
+function buildStars(){
+  stars.length=0;
+  const n=Math.min(5000, Math.round((W*H)/9000));
+  for(let i=0;i<n;i++) stars.push({x:Math.random()*W,y:Math.random()*H,z:Math.random()*2+0.5});
+}
 
 // ---------- Enemies & Powerups ----------
 let enemyTimer=0;
 function nextEnemyTime(){ return ENEMY_MIN_INTERVAL + Math.random()*(ENEMY_MAX_INTERVAL-ENEMY_MIN_INTERVAL); }
 function spawnEnemy(){
   const side=Math.random()<0.5?-40:W+40, y=30+Math.random()*60, dir=side<0?1:-1;
-  enemies.push({x:side,y,w:16,h:12,vx:80*dir,vy:24,state:"home",t:0,alive:true, trail:[]}); // [CHANGED] add trail array
+  enemies.push({x:side,y,w:16,h:12,vx:80*dir,vy:24,state:"home",t:0,alive:true, trail:[]});
 }
 function dropPowerup(x,y){
   const type=Math.random()<0.5?"shield":"rapid";
-  powerups.push({x,y,w:10,h:10,vy:120+Math.random()*80,vx:(Math.random()*50-25),type,alive:true,a:0});
+  // renderY initialized to y so it's finite on first frame
+  powerups.push({x,y,renderY:y,w:12,h:12,vy:120+Math.random()*80,vx:(Math.random()*50-25),type,alive:true,a:0,seed:Math.random()*6.283,lastSparkle:0});
 }
 
 // ---------- Audio ----------
 let audioCtx;
+function ensureAudio(){try{
+  audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+  audioCtx.resume?.();
+}catch{}}
 function blip(f=440,d=0.05){try{
   audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
   const o=audioCtx.createOscillator(), g=audioCtx.createGain();
@@ -181,14 +196,14 @@ function blip(f=440,d=0.05){try{
 
 // ---------- Reset / Init ----------
 function hardReset(){
-  score=0; lives=5; state="play"; t=0; shake=0; winTimer=0; rapidTime=0; hasShield=false;
-  ship={x:W/2,y:shipBaselineY(),w:28,h:18,vx:0,cooldown:0};                        // [CHANGED]
+  score=0; lives=5; state="play"; t=0; shake=0; winTimer=0; rapidTime=0; hasShield=false; invuln=0;
+  ship={x:W/2,y:shipBaselineY(),w:28,h:18,vx:0,cooldown:0};
   instantiateBricks(); buildStars();
   bullets.length=debris.length=particles.length=enemies.length=powerups.length=0;
   enemyTimer=nextEnemyTime();
 }
 function init(){
-  resize();
+  _resizeNow();
   buildWordGrid("بكفي");
   layoutWordFit();
   hardReset();
@@ -203,18 +218,24 @@ addEventListener('keydown',e=>{
 });
 addEventListener('keyup',e=>keys[e.code]=false);
 stage.addEventListener('pointerdown',e=>{
+  ensureAudio();
   const now=performance.now();
   if(now-lastTap<300){ if(!document.fullscreenElement) stage.requestFullscreen?.(); else document.exitFullscreen?.(); }
-  lastTap=now; pointerDown=true; pointerX=e.clientX; stage.setPointerCapture?.(e.pointerId);
+  lastTap=now;
+  pointerDown=true; pointerX=e.clientX; pointerSmoothedX=e.clientX;
+  stage.setPointerCapture?.(e.pointerId);
 });
-stage.addEventListener('pointermove',e=>{ if(pointerDown) pointerX=e.clientX; });
-stage.addEventListener('pointerup',e=>{ pointerDown=false; pointerX=null; });
-stage.addEventListener('click',()=>{ if(state==="over" || (state==="win" && winTimer>4)) hardReset(); });
+stage.addEventListener('pointermove',e=>{ if(pointerDown){ pointerX=e.clientX; } });
+stage.addEventListener('pointerup',()=>{ pointerDown=false; pointerX=null; });
+stage.addEventListener('click',()=>{
+  if(state==="over" || (state==="win" && winTimer>0.5)) hardReset();
+});
 
 // ---------- Game update ----------
 function hitPlayer(){
-  if(hasShield){ hasShield=false; blip(180,.08); return; }
-  lives--; blip(120,.12); shake=Math.max(shake, SHAKE_HIT*1.5);
+  if(invuln>0) return;
+  if(hasShield){ hasShield=false; blip(180,.08); invuln=0.8; return; }
+  lives--; blip(120,.12); shake=Math.max(shake, SHAKE_HIT*1.5); invuln=0.8;
   if(lives<=0) state="over"; else { ship.x=W/2; ship.vx=0; bullets.length=0; }
 }
 
@@ -222,19 +243,32 @@ function collectPowerup(p){ if(p.type==="shield") hasShield=true; else rapidTime
 
 function update(dt){
   if(state!=="play" && state!=="win") return;
-  t+=dt;
+  t+=dt; if(invuln>0) invuln-=dt;
 
   // stars
-  for(const s of stars){ s.y += (state==="win"?10:20)*s.z*dt; if(s.y>H) s.y-=H; }
+  for(let i=0;i<stars.length;i++){ const s=stars[i]; s.y += (state==="win"?10:20)*s.z*dt; if(s.y>H) s.y-=H; }
 
-  // ship movement (keys + touch)
-  let target=0; if(keys.ArrowLeft||keys.KeyA)target-=1; if(keys.ArrowRight||keys.KeyD)target+=1;
-  if(pointerDown && pointerX!=null){ const dx=(pointerX-ship.x); target=Math.sign(dx); ship.vx+=Math.max(-SHIP_ACCEL*dt,Math.min(SHIP_ACCEL*dt,dx*4)); }
-  const desired=target*SHIP_MAX_SPEED, delta=desired-ship.vx, accel=(target?SHIP_ACCEL:SHIP_FRICTION)*dt;
+  // Smooth movement (EMA + deadzone)
+  let targetVel = 0;
+  if(pointerDown && pointerX!=null){
+    if(pointerSmoothedX==null) pointerSmoothedX=pointerX;
+    pointerSmoothedX += (pointerX - pointerSmoothedX) * 0.22;
+    const dx = pointerSmoothedX - ship.x;
+    const dead = 2.5;
+    const adjDx = Math.abs(dx) < dead ? 0 : dx;
+    targetVel = Math.max(-SHIP_MAX_SPEED, Math.min(SHIP_MAX_SPEED, adjDx * 6));
+  } else {
+    if(keys.ArrowLeft||keys.KeyA) targetVel -= SHIP_MAX_SPEED;
+    if(keys.ArrowRight||keys.KeyD) targetVel += SHIP_MAX_SPEED;
+  }
+  const accel = (targetVel===0 ? SHIP_FRICTION : SHIP_ACCEL) * dt;
+  const delta = targetVel - ship.vx;
   ship.vx += Math.max(-accel, Math.min(accel, delta));
-  if(!target && !pointerDown){ const s=Math.sign(ship.vx); ship.vx -= s*Math.min(Math.abs(ship.vx), SHIP_FRICTION*dt*0.6); }
+  if(!pointerDown && !(keys.ArrowLeft||keys.KeyA||keys.ArrowRight||keys.KeyD)){
+    const s=Math.sign(ship.vx); ship.vx -= s*Math.min(Math.abs(ship.vx), SHIP_FRICTION*dt*0.6);
+  }
   ship.x=Math.max(20,Math.min(W-20, ship.x + ship.vx*dt));
-  ship.y = shipBaselineY();                                                    // [CHANGED] keep higher baseline
+  ship.y = shipBaselineY();
 
   // shooting
   const cd = rapidTime>0 ? RAPID_COOLDOWN : BASE_COOLDOWN;
@@ -245,90 +279,132 @@ function update(dt){
   }
   if(rapidTime>0) rapidTime-=dt;
 
-  // bullets
-  for(const b of bullets){ b.y+=b.vy*dt; b.life-=dt*0.9; }
-  bullets=bullets.filter(b=>b.y>-20 && b.life>0);
+  // bullets (compact)
+  let write=0;
+  for(let i=0;i<bullets.length;i++){
+    const b=bullets[i];
+    b.y+=b.vy*dt; b.life-=dt*0.9;
+    if(b.y>-20 && b.life>0) bullets[write++]=b;
+  }
+  bullets.length=write;
 
-  // word drift
+  // drift
   const wdx=Math.sin(t*0.55)*18, wdy=Math.sin(t*1.05)*3;
 
   // bullet vs bricks
-  for(const br of bricks){
-    if(!br.alive) continue;
+  for(let bi=0; bi<bricks.length; bi++){
+    const br=bricks[bi]; if(!br.alive) continue;
     const bx=wordOffX + br.bx*wordScale + wdx;
     const by=wordOffY + br.by*wordScale + wdy;
     const bw=br.w*wordScale, bh=br.h*wordScale;
 
-    for(const bu of bullets){
+    for(let i=0;i<bullets.length;i++){
+      const bu=bullets[i];
       if(bu.x>bx && bu.x<bx+bw && bu.y>by && bu.y<by+bh){
         br.alive=false; bu.y=-9999; score+=10; blip(240,.04); shake=Math.min(0.06, shake+SHAKE_HIT);
-
-        // flash + shards + sparks (existing)
         particles.push({x:bx,y:by,w:bw,h:bh,type:"flash",life:.08});
-        for(let i=0;i<6;i++){
+        for(let k=0;k<6;k++){
           const ang=Math.random()*6.283, spd=140+Math.random()*220, sz=1+Math.random()*2;
           particles.push({x:bx+bw/2,y:by+bh/2,vx:Math.cos(ang)*spd,vy:Math.sin(ang)*spd,sz,life:.5+Math.random()*.35,col:pal.brick,type:"shard"});
         }
-        for(let i=0;i<10;i++){
+        for(let k=0;k<10;k++){
           const ang=Math.random()*6.283, spd=90+Math.random()*160;
-          particles.push({x:bx+bw/2,y:by+bh/2,vx:Math.cos(ang)*spd,vy:Math.sin(ang)*spd,life:.55+Math.random()*.35,col:i%2?pal.brick:"#ffd7d7",type:"pix"});
+          particles.push({x:bx+bw/2,y:by+bh/2,vx:Math.cos(ang)*spd,vy:Math.sin(ang)*spd,life:.55+Math.random()*.35,col:k%2?pal.brick:"#ffd7d7",type:"pix"});
         }
-
         if(Math.random()<DEBRIS_CHANCE)
-          debris.push({x:bx+bw/2,y:by+bh/2,w:7,h:7,vy:220+Math.random()*190,vx:(Math.random()*90-45),a:0,spin:(Math.random()*.4-.2),alive:true,px:bx+bw/2,py:by+bh/2}); // [CHANGED] sharper & faster, store px/py
+          debris.push({x:bx+bw/2,y:by+bh/2,w:7,h:7,vy:220+Math.random()*190,vx:(Math.random()*90-45),a:0,spin:(Math.random()*.4-.2),alive:true,px:bx+bw/2,py:by+bh/2});
         if(Math.random()<DROP_CHANCE) dropPowerup(bx+bw/2, by+bh/2);
+        break;
       }
     }
   }
 
-  // debris (store previous position for trail)
-  for(const d of debris){
-    d.px = d.x; d.py = d.y;                                              // [NEW] keep previous pos
+  // debris
+  write=0;
+  for(let i=0;i<debris.length;i++){
+    const d=debris[i];
+    d.px = d.x; d.py = d.y;
     d.x+=d.vx*dt; d.y+=d.vy*dt; d.a+=d.spin;
     if(state==="play" && rectHit(ship.x-12,ship.y-10,24,20,d.x-d.w/2,d.y-d.h/2,d.w,d.h)){ d.alive=false; hitPlayer(); }
+    if(d.alive && d.y<H+20) debris[write++]=d;
   }
-  debris=debris.filter(d=>d.alive && d.y<H+20);
+  debris.length=write;
 
   // powerups
-  for(const p of powerups){ p.x+=p.vx*dt; p.y+=p.vy*dt; p.a=(p.a||0)+0.08;
-    if(rectHit(ship.x-12,ship.y-10,24,20,p.x-p.w/2,p.y-p.h/2,p.w,p.h)){ p.alive=false; collectPowerup(p); blip(700,.06); } }
-  powerups=powerups.filter(p=>p.alive && p.y<H+20);
+  write=0;
+  for(let i=0;i<powerups.length;i++){
+    const p=powerups[i];
+    const bob = Math.sin(t*2 + p.seed)*10;
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.a=(p.a||0)+0.08;
+    p.renderY = p.y + bob;
 
-  // enemies (home -> dive)
+    // magnet
+    const dx = ship.x - p.x, dy = ship.y - p.y;
+    const dist = Math.hypot(dx,dy);
+    if(dist < MAGNET_RADIUS){
+      const ux = dx/(dist||1), uy = dy/(dist||1);
+      const pull = (1 - dist/MAGNET_RADIUS);
+      p.vx += ux * MAGNET_STRENGTH * pull * dt;
+      p.vy += uy * MAGNET_STRENGTH * pull * dt;
+    }
+
+    // pickup
+    if(rectHit(ship.x-12,ship.y-10,24,20,p.x-p.w/2,p.renderY-p.h/2,p.w,p.h)){ p.alive=false; collectPowerup(p); blip(700,.06); }
+
+    // sparkles
+    p.lastSparkle += dt*SPARKLE_RATE;
+    while(p.lastSparkle>=1){
+      p.lastSparkle -= 1;
+      const ang=Math.random()*6.283, spd=40+Math.random()*80;
+      particles.push({x:p.x, y:p.renderY, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, life:.5+Math.random()*.3, col:(p.type==="shield"?"#ffefaa":"#aee7ff"), type:"pix"});
+    }
+
+    if(p.alive && p.renderY<H+24) powerups[write++]=p;
+  }
+  powerups.length=write;
+
+  // enemies
   if(state==="play"){ enemyTimer-=dt; if(enemyTimer<=0 && enemies.filter(e=>e.alive).length<ENEMY_MAX_ACTIVE){ spawnEnemy(); enemyTimer=nextEnemyTime(); } }
-  for(const e of enemies){
-    if(!e.alive) continue; e.t+=dt;
+  write=0;
+  for(let i=0;i<enemies.length;i++){
+    const e=enemies[i]; if(!e.alive){ continue; }
+    e.t+=dt;
 
-    // keep a short trail of previous positions (threatening afterimage) --- [NEW]
     e.trail.push({x:e.x,y:e.y,life:0.25});
     if(e.trail.length>10) e.trail.shift();
-    for(const tr of e.trail) tr.life -= dt;
+    for(let j=0;j<e.trail.length;j++){ e.trail[j].life -= dt; }
 
     const dx=ship.x-e.x, dy=(ship.y-40)-e.y, dist=Math.hypot(dx,dy)+1e-3, ux=dx/dist, uy=dy/dist;
     if(e.state==="home"){ e.vx+=ux*80*dt; e.vy+=uy*60*dt; if(e.t>1.1 && Math.random()<0.02) e.state="dive"; }
     else { e.vx+=ux*130*dt; e.vy+=uy*170*dt; }
-    const sp=Math.hypot(e.vx,e.vy), max=(e.state==="dive"?240:165); if(sp>max){ e.vx=e.vx/sp*max; e.vy=e.vy/sp*max; } // [CHANGED] slightly faster when diving
+    const sp=Math.hypot(e.vx,e.vy), max=(e.state==="dive"?240:165); if(sp>max){ e.vx=e.vx/sp*max; e.vy=e.vy/sp*max; }
     e.x+=e.vx*dt; e.y+=e.vy*dt; if(e.x<-60||e.x>W+60||e.y>H+60) e.alive=false;
 
-    // bullet hit
-    for(const bu of bullets){
+    for(let b=0;b<bullets.length;b++){
+      const bu=bullets[b];
       if(bu.x>e.x-e.w/2&&bu.x<e.x+e.w/2&&bu.y>e.y-e.h/2&&bu.y<e.y+e.h/2){
         e.alive=false; bu.y=-9999; score+=15; blip(300,.05); shake=Math.min(0.06, shake+SHAKE_HIT*0.8);
-        for(let i=0;i<14;i++){ const a=Math.random()*6.283, spd=100+Math.random()*180; particles.push({x:e.x,y:e.y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:.5+Math.random()*.4,col:pal.enemy,type:"pix"}); }
+        for(let k=0;k<14;k++){ const a=Math.random()*6.283, spd=100+Math.random()*180; particles.push({x:e.x,y:e.y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:.5+Math.random()*.4,col:pal.enemy,type:"pix"}); }
         if(Math.random()<0.08) dropPowerup(e.x,e.y);
+        break;
       }
     }
-    if(state==="play" && rectHit(ship.x-12,ship.y-10,24,20,e.x-e.w/2,e.y-e.h/2,e.w,e.h)){ e.alive=false; hitPlayer(); }
-  }
-  enemies=enemies.filter(e=>e.alive);
+    if(state==="play" && e.alive && rectHit(ship.x-12,ship.y-10,24,20,e.x-e.w/2,e.y-e.h/2,e.w,e.h)){ e.alive=false; hitPlayer(); }
 
-  // particles sim
-  for(const p of particles){
-    if(p.type==="flash"){ p.life-=dt; continue; }
+    if(e.alive) enemies[write++]=e;
+  }
+  enemies.length=write;
+
+  // particles
+  write=0;
+  for(let i=0;i<particles.length;i++){
+    const p=particles[i];
+    if(p.type==="flash"){ p.life-=dt; if(p.life>0) particles[write++]=p; continue; }
     p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy += (p.type==="shard"?120:40)*dt;
     p.life-=dt;
+    if(p.life>0) particles[write++]=p;
   }
-  particles=particles.filter(p=>p.life>0);
+  particles.length=write;
 
   // win?
   if(state==="play" && !bricks.some(b=>b.alive)){ state="win"; winTimer=0; blip(660,.1); blip(990,.12); }
@@ -347,7 +423,6 @@ function hudBanner(text,color="#fff"){
   ctx.fillStyle="rgba(255,255,255,.85)"; ctx.font="16px monospace"; ctx.fillText(hint, W/2, H/2+22);
 }
 
-// --- helpers for threat shapes [NEW] ---
 function drawGlowRect(x,y,w,h,blur,color,alpha=1){
   ctx.save();
   ctx.globalAlpha=alpha;
@@ -358,18 +433,14 @@ function drawGlowRect(x,y,w,h,blur,color,alpha=1){
   ctx.restore();
 }
 function drawEnemySpikes(cx,cy,r,arms=6,rot=0,color="#b687ff"){
-  ctx.save();
-  ctx.translate(cx,cy);
-  ctx.rotate(rot);
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(rot);
   ctx.beginPath();
   for(let i=0;i<arms;i++){
     const a = (i/arms)*Math.PI*2;
     ctx.moveTo(Math.cos(a)*r, Math.sin(a)*r);
     ctx.lineTo(Math.cos(a+0.08)*(r+8), Math.sin(a+0.08)*(r+8));
   }
-  ctx.strokeStyle=color;
-  ctx.lineWidth=2;
-  ctx.stroke();
+  ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
   ctx.restore();
 }
 
@@ -380,7 +451,7 @@ function draw(){
   ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
 
   // stars
-  ctx.fillStyle="rgba(255,255,255,.85)"; for(const s of stars) ctx.fillRect(s.x,s.y,1,1);
+  ctx.fillStyle="rgba(255,255,255,.85)"; for(let i=0;i<stars.length;i++){ const s=stars[i]; ctx.fillRect(s.x,s.y,1,1); }
 
   // walls
   ctx.fillStyle=pal.wall; ctx.fillRect(0,0,W,8); ctx.fillRect(0,H-8,W,8); ctx.fillRect(0,0,8,H); ctx.fillRect(W-8,0,8,H);
@@ -388,87 +459,105 @@ function draw(){
   const dx=Math.sin(t*0.55)*18, dy=Math.sin(t*1.05)*3;
 
   // bricks
-  for(const b of bricks){ if(!b.alive) continue;
+  for(let i=0;i<bricks.length;i++){ const b=bricks[i]; if(!b.alive) continue;
     const x=wordOffX + b.bx*wordScale + dx, y=wordOffY + b.by*wordScale + dy, bw=b.w*wordScale, bh=b.h*wordScale;
     ctx.fillStyle=pal.brick; ctx.fillRect(x,y,bw,bh);
     ctx.fillStyle="rgba(255,255,255,.12)"; ctx.fillRect(x+1,y+1,bw-2,2);
   }
 
-  // debris — glow, trail, diamond shape (feels hot)  [CHANGED]
-  for(const d of debris){
-    // trail
+  // debris
+  for(let i=0;i<debris.length;i++){
+    const d=debris[i];
     ctx.save();
     ctx.globalAlpha = 0.35;
     ctx.strokeStyle = "rgba(255,120,120,.55)";
     ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(d.px, d.py);
-    ctx.lineTo(d.x, d.y);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(d.px, d.py); ctx.lineTo(d.x, d.y); ctx.stroke();
     ctx.restore();
 
-    ctx.save();
-    ctx.translate(d.x, d.y);
-    ctx.rotate(d.a||0);
-
-    // glow
-    ctx.shadowColor = "rgba(255,60,60,.9)";
-    ctx.shadowBlur = 12;
-
-    // diamond
+    ctx.save(); ctx.translate(d.x, d.y); ctx.rotate(d.a||0);
+    ctx.shadowColor = "rgba(255,60,60,.9)"; ctx.shadowBlur = 12;
     const s = Math.max(d.w, d.h);
     ctx.fillStyle = "#ff4a4a";
     ctx.beginPath();
-    ctx.moveTo(0, -s*0.75);
-    ctx.lineTo(s*0.6, 0);
-    ctx.lineTo(0,  s*0.75);
-    ctx.lineTo(-s*0.6,0);
-    ctx.closePath();
-    ctx.fill();
-
-    // white-hot core
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = "rgba(255,240,240,.9)";
-    ctx.fillRect(-1,-1,2,2);
+    ctx.moveTo(0, -s*0.75); ctx.lineTo(s*0.6, 0); ctx.lineTo(0,  s*0.75); ctx.lineTo(-s*0.6,0);
+    ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = "rgba(255,240,240,.9)"; ctx.fillRect(-1,-1,2,2);
     ctx.restore();
   }
 
-  // enemies — pulsing core, spikes, glow, afterimage trail  [CHANGED]
-  for(const e of enemies){
-    // afterimage
-    for(const tr of e.trail){
-      if(tr.life<=0) continue;
+  // enemies
+  for(let i=0;i<enemies.length;i++){
+    const e=enemies[i];
+    for(let j=0;j<e.trail.length;j++){
+      const tr=e.trail[j]; if(tr.life<=0) continue;
       const a = Math.max(0, tr.life*3);
       drawGlowRect(tr.x-6,tr.y-4,12,8,6,"rgba(182,135,255,"+a*0.6+")", a*0.5);
     }
-
     const pulse = 1 + 0.22*Math.sin(t*6 + e.t*4);
     const ang = Math.atan2(e.vy, e.vx) + Math.PI/2;
-
-    // spikes
     drawEnemySpikes(e.x, e.y, 10*pulse, 6, t*3, "rgba(255,80,120,.9)");
-
-    // body glow
     drawGlowRect(e.x-8, e.y-6, 16, 12, 14, "rgba(182,135,255,.9)", 0.9);
+    ctx.fillStyle=pal.enemy; ctx.fillRect(e.x-e.w/2, e.y-e.h/2, e.w, e.h);
+    ctx.save(); ctx.translate(e.x, e.y); ctx.rotate(ang); ctx.fillStyle="rgba(255,90,90,.9)"; ctx.fillRect(-2,-3,4,6); ctx.restore();
+  }
 
-    // body
-    ctx.fillStyle=pal.enemy;
-    ctx.fillRect(e.x-e.w/2, e.y-e.h/2, e.w, e.h);
+  // --- POWERUPS: halo + pulse + icon (guarded gradient) ---
+  for(let i=0;i<powerups.length;i++){
+    const p=powerups[i];
+    const baseX=p.x;
+    const baseY=Number.isFinite(p.renderY) ? p.renderY : p.y;  // fallback safety
+    const sc = 1 + 0.25*Math.sin(t*6 + (p.seed||0));
+    const rad = 14*sc;
 
-    // "eye" core
+    if(Number.isFinite(baseX) && Number.isFinite(baseY) && Number.isFinite(rad) && rad>0){
+      // halo
+      const g = ctx.createRadialGradient(baseX,baseY,2, baseX,baseY,rad);
+      const c1=(p.type==="shield")?"rgba(255,209,102,0.9)":"rgba(110,203,255,0.9)";
+      const c2=(p.type==="shield")?"rgba(255,209,102,0.05)":"rgba(110,203,255,0.05)";
+      g.addColorStop(0, c1);
+      g.addColorStop(1, c2);
+      ctx.fillStyle=g;
+      ctx.beginPath(); ctx.arc(baseX,baseY,rad,0,Math.PI*2); ctx.fill();
+    } else {
+      // ultra-safe fallback: simple circle
+      ctx.fillStyle=(p.type==="shield")?pal.powShield:pal.powRapid;
+      ctx.beginPath(); ctx.arc(baseX||0,baseY||0,8,0,Math.PI*2); ctx.fill();
+    }
+
+    // glowing core
     ctx.save();
-    ctx.translate(e.x, e.y);
-    ctx.rotate(ang);
-    ctx.fillStyle="rgba(255,90,90,.9)";
-    ctx.fillRect(-2,-3,4,6);
+    ctx.translate(baseX, baseY); ctx.rotate((p.a||0)*0.7);
+    ctx.shadowColor = (p.type==="shield")?"rgba(255,209,102,0.9)":"rgba(110,203,255,0.9)";
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = (p.type==="shield")?pal.powShield:pal.powRapid;
+    const w = p.w*sc, h = p.h*sc;
+
+    if(p.type==="shield"){
+      ctx.beginPath();
+      ctx.moveTo(0, -h*0.9); ctx.lineTo(w*0.7, 0); ctx.lineTo(0,  h*0.9); ctx.lineTo(-w*0.7,0);
+      ctx.closePath(); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle="#000"; ctx.fillRect(-1, -h*0.25, 2, h*0.22);
+    }else{
+      ctx.beginPath();
+      ctx.moveTo(-w*0.7, -h*0.5); ctx.lineTo(0, 0); ctx.lineTo(-w*0.7, h*0.5); ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(-w*0.2, -h*0.5); ctx.lineTo(w*0.5, 0); ctx.lineTo(-w*0.2, h*0.5); ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+
+    // small outline
+    ctx.save();
+    ctx.strokeStyle="rgba(255,255,255,0.5)";
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.arc(baseX, baseY, (p.w+p.h)*0.5*0.55*(sc||1), 0, Math.PI*2); ctx.stroke();
     ctx.restore();
   }
 
-  // powerups
-  for(const p of powerups){ ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.a||0); ctx.fillStyle=(p.type==="shield"?pal.powShield:pal.powRapid); ctx.fillRect(-p.w/2,-p.h/2,p.w,p.h); ctx.restore(); }
-
   // particles
-  for(const p of particles){
+  for(let i=0;i<particles.length;i++){
+    const p=particles[i];
     if(p.type==="flash"){ ctx.fillStyle="rgba(255,255,255,0.25)"; ctx.fillRect(p.x,p.y,p.w,p.h); continue; }
     ctx.globalAlpha=Math.max(0, p.life*1.2);
     ctx.fillStyle=p.col||"#fff";
@@ -477,15 +566,18 @@ function draw(){
     ctx.globalAlpha=1;
   }
 
-  // ship
+  // ship (flicker when invulnerable)
+  if(invuln>0 && ((t*20|0)%2===0)) ctx.globalAlpha=0.35;
   ctx.fillStyle=pal.ship;
   ctx.beginPath(); ctx.moveTo(ship.x,ship.y-12); ctx.lineTo(ship.x-14,ship.y+10); ctx.lineTo(ship.x+14,ship.y+10); ctx.closePath(); ctx.fill();
+  ctx.globalAlpha=1;
   if(hasShield){ ctx.strokeStyle=pal.powShield; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(ship.x,ship.y-2,18,0,Math.PI*2); ctx.stroke(); }
 
   // bullets
-  ctx.fillStyle=pal.bullet; for(const bu of bullets) ctx.fillRect(bu.x-1,bu.y,3,10);
+  for(let i=0;i<bullets.length;i++){ const bu=bullets[i]; ctx.globalAlpha=Math.max(0.4, bu.life); ctx.fillStyle=pal.bullet; ctx.fillRect(bu.x-1,bu.y,3,10); }
+  ctx.globalAlpha=1;
 
-  // HUD (LTR)
+  // HUD
   ctx.direction="ltr"; ctx.textAlign="left"; ctx.textBaseline="top";
   ctx.font="bold 20px monospace"; ctx.fillStyle="#cde4ff"; ctx.fillText("SCORE", 16, 12);
   ctx.font="bold 20px monospace"; ctx.fillStyle="#fff"; ctx.fillText(String(score).padStart(6,"0"), 16, 36);
@@ -511,4 +603,3 @@ requestAnimationFrame(loop);
 </script>
 </body>
 </html>
-
